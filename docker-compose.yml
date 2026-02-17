@@ -1,0 +1,63 @@
+version: "3.8"
+
+services:
+  defect-detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fabric-defect-detector:jetpack6
+    container_name: fabric-defect-detector
+
+    # GPU access (JetPack 6 uses CDI instead of --runtime=nvidia)
+    runtime: nvidia
+
+    # Host networking — REQUIRED for GigE camera discovery
+    network_mode: host
+
+    # Privileged — required for MVS SDK raw socket access to GigE camera
+    privileged: true
+
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - MVCAM_COMMON_RUNENV=/opt/MVS
+      - MVCAM_SDK_PATH=/opt/MVS
+      - LD_LIBRARY_PATH=/opt/MVS/lib/aarch64
+
+      # ── App Configuration (override via .env file or CLI) ──
+      - CAMERA_IP=${CAMERA_IP:-192.168.1.128}
+      - MODEL_PATH=${MODEL_PATH:-/app/model/best.engine}
+      - CONF_THRESHOLD=${CONF_THRESHOLD:-0.20}
+      - IOU_THRESHOLD=${IOU_THRESHOLD:-0.20}
+      - IMG_SIZE=${IMG_SIZE:-416}
+      - TARGET_FPS=${TARGET_FPS:-15}
+      - EXPOSURE_TIME=${EXPOSURE_TIME:-410.0}
+      - GAIN=${GAIN:-20.0}
+      - HEADLESS=${HEADLESS:-true}
+      - ENABLE_WEB=${ENABLE_WEB:-true}
+      - WEB_PORT=${WEB_PORT:-3000}
+      - RELAY_ENABLED=${RELAY_ENABLED:-true}
+      - RELAY_PIN=${RELAY_PIN:-7}
+
+    volumes:
+      # ── App code (EDITABLE — edit on Jetson, changes reflect instantly) ──
+      - ./app:/app
+
+      # ── Model files ──
+      - ./model:/app/model
+
+      # ── Results output (persisted on host) ──
+      - ./results:/app/results
+
+      # ── X11 display forwarding ──
+      - /tmp/.X11-unix:/tmp/.X11-unix
+
+      # ── GPIO access for relay control ──
+      - /sys:/sys
+      - /proc/device-tree:/proc/device-tree:ro
+
+    # Auto-restart on crash
+    restart: unless-stopped
+
+    # Send stdin for interactive use
+    stdin_open: true
+    tty: true
