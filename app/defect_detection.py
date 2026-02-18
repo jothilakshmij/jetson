@@ -19,13 +19,17 @@ import cv2
 from ctypes import *
 from datetime import datetime
 import threading
-from flask import Flask, Response, render_template_string, jsonify, request
+import logging
+from flask import Flask, Response, render_template_string, jsonify
 
 # =========================
 # GPIO / RELAY CONTROL
 # =========================
 RELAY_ENABLED = os.environ.get("RELAY_ENABLED", "true").lower() in ("true", "1", "yes")
-RELAY_PIN = int(os.environ.get("RELAY_PIN", "7"))  # BOARD pin 7 = GPIO09
+RELAY_PIN = int(os.environ.get("RELAY_PIN", "7"))              # BOARD pin 7  — Relay output
+TRIGGER_PIN = int(os.environ.get("TRIGGER_PIN", "33"))          # BOARD pin 33 — Trigger input
+RELAY_ON_DURATION = float(os.environ.get("RELAY_ON_DURATION", "2.0"))  # seconds relay stays ON
+TRIGGER_POLL_INTERVAL = 0.1  # seconds between GPIO input polls
 
 GPIO = None
 if RELAY_ENABLED:
@@ -33,8 +37,14 @@ if RELAY_ENABLED:
         import Jetson.GPIO as GPIO
         GPIO.setmode(GPIO.BOARD)
         GPIO.setwarnings(False)
-        GPIO.setup(RELAY_PIN, GPIO.OUT, initial=GPIO.LOW)
-        print(f"\u2713 Relay GPIO initialized on Pin {RELAY_PIN} (BOARD mode)")
+        # Pin 7: Relay output (HIGH = relay OFF, LOW = relay ON)
+        GPIO.setup(RELAY_PIN, GPIO.OUT, initial=GPIO.HIGH)
+        # Pin 33: Trigger input (pull-down, idle LOW, detect HIGH to start detection)
+        GPIO.setup(TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+        print(f"\u2713 GPIO initialized")
+        print(f"  Pin {RELAY_PIN}: Relay OUTPUT (HIGH=OFF, LOW=ON)")
+        print(f"  Pin {TRIGGER_PIN}: Trigger INPUT (pull-down, idle LOW, detect HIGH)")
+        print(f"  Flow: Detect → defect found → relay ON {RELAY_ON_DURATION}s + wait Pin {TRIGGER_PIN} HIGH → resume")
     except ImportError:
         print("WARNING: Jetson.GPIO not available — relay control disabled")
         print("  Install with: pip3 install Jetson.GPIO")
@@ -43,31 +53,74 @@ if RELAY_ENABLED:
         print(f"WARNING: GPIO init failed: {e} — relay control disabled")
         RELAY_ENABLED = False
 
-# Pause/Resume state
-machine_paused = False
-pause_lock = threading.Lock()
-pause_event = threading.Event()
-pause_event.set()  # Start in running state
+# Relay status for UI
+relay_status = "DETECTING"  # DETECTING, DEFECT_STOP, RELAY_ON, WAITING_RESUME
+relay_status_lock = threading.Lock()
 
-def activate_relay():
-    """Send HIGH signal to relay — stops the machine"""
-    global machine_paused
-    if RELAY_ENABLED and GPIO:
-        GPIO.output(RELAY_PIN, GPIO.HIGH)
-    with pause_lock:
-        machine_paused = True
-    pause_event.clear()
-    print("\u26a0  RELAY ACTIVATED — Machine STOPPED (defect detected)")
+def set_relay_status(status):
+    global relay_status
+    with relay_status_lock:
+        relay_status = status
 
-def deactivate_relay():
-    """Send LOW signal to relay — resumes the machine"""
-    global machine_paused
+def get_relay_status():
+    with relay_status_lock:
+        return relay_status
+
+def pulse_relay():
+    """Turn relay ON for RELAY_ON_DURATION seconds, then turn OFF (runs in background thread)"""
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    set_relay_status("RELAY_ON")
     if RELAY_ENABLED and GPIO:
-        GPIO.output(RELAY_PIN, GPIO.LOW)
-    with pause_lock:
-        machine_paused = False
-    pause_event.set()
-    print("\u2713 RELAY DEACTIVATED — Machine RESUMED")
+        GPIO.output(RELAY_PIN, GPIO.LOW)  # LOW = relay ON
+        print(f"  [{ts}] Pin {RELAY_PIN} → LOW (Relay ON)")
+    print(f"  [{ts}] \u26a0 RELAY ON for {RELAY_ON_DURATION}s...")
+    time.sleep(RELAY_ON_DURATION)
+    if RELAY_ENABLED and GPIO:
+        GPIO.output(RELAY_PIN, GPIO.HIGH)  # HIGH = relay OFF
+    ts2 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    print(f"  [{ts2}] Pin {RELAY_PIN} → HIGH (Relay OFF)")
+    print(f"  [{ts2}] \u2713 RELAY OFF")
+
+def wait_for_resume_signal():
+    """Block until Pin 33 receives a sustained HIGH signal to resume detection"""
+    set_relay_status("WAITING_RESUME")
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    DEBOUNCE_COUNT = 5       # Must read HIGH this many times in a row
+    DEBOUNCE_DELAY = 0.1     # Delay between each debounce read (total = 0.5s sustained HIGH)
+    if RELAY_ENABLED and GPIO:
+        initial = 'HIGH' if GPIO.input(TRIGGER_PIN) else 'LOW'
+        print(f"  [{ts}] Waiting for resume signal on Pin {TRIGGER_PIN} (HIGH)...")
+        print(f"  [{ts}] Pin {TRIGGER_PIN} current state: {initial}")
+        if initial == 'HIGH':
+            print(f"  [{ts}] Pin {TRIGGER_PIN} already HIGH — waiting for LOW first...")
+            while GPIO.input(TRIGGER_PIN) == GPIO.HIGH:
+                time.sleep(TRIGGER_POLL_INTERVAL)
+            ts2 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(f"  [{ts2}] Pin {TRIGGER_PIN} is now LOW — ready to detect resume signal")
+            time.sleep(0.5)  # Settle time
+
+        while True:
+            pin_state = GPIO.input(TRIGGER_PIN)
+            if pin_state == GPIO.HIGH:
+                # Debounce: require DEBOUNCE_COUNT consecutive HIGH reads
+                high_count = 0
+                for i in range(DEBOUNCE_COUNT):
+                    time.sleep(DEBOUNCE_DELAY)
+                    if GPIO.input(TRIGGER_PIN) == GPIO.HIGH:
+                        high_count += 1
+                    else:
+                        break
+                if high_count == DEBOUNCE_COUNT:
+                    ts2 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    print(f"  [{ts2}] Pin {TRIGGER_PIN} confirmed HIGH — resume signal received!")
+                    return
+                else:
+                    ts2 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+                    print(f"  [{ts2}] Pin {TRIGGER_PIN} false trigger ({high_count}/{DEBOUNCE_COUNT} HIGH reads) — ignoring")
+            time.sleep(TRIGGER_POLL_INTERVAL)
+    else:
+        # No GPIO — just log and return immediately (continuous detection)
+        print(f"  [{ts}] No GPIO — skipping resume wait")
 
 # =========================
 # MVS SDK IMPORT
@@ -115,8 +168,10 @@ live_stats = {
     "uptime": 0,
     "model": "",
     "camera_ip": "",
-    "machine_paused": False,
-    "relay_enabled": RELAY_ENABLED
+    "relay_enabled": RELAY_ENABLED,
+    "relay_status": "DETECTING",
+    "relay_pin": RELAY_PIN,
+    "trigger_pin": TRIGGER_PIN
 }
 stats_lock = threading.Lock()
 
@@ -152,6 +207,8 @@ print(f"  Gain:          {GAIN}")
 print(f"  Display:       {'ON' if HAS_DISPLAY else 'HEADLESS'}")
 print(f"  Web Stream:    {'http://0.0.0.0:' + str(WEB_PORT) if ENABLE_WEB else 'OFF'}")
 print(f"  Relay:         {'Pin ' + str(RELAY_PIN) + ' (ENABLED)' if RELAY_ENABLED else 'DISABLED'}")
+print(f"  Trigger Pin:   {'Pin ' + str(TRIGGER_PIN) + ' (resume after defect)' if RELAY_ENABLED else 'N/A'}")
+print(f"  Relay Duration:{RELAY_ON_DURATION}s")
 print(f"  Results:       {RESULTS_FOLDER}")
 print("=" * 70)
 
@@ -159,6 +216,17 @@ print("=" * 70)
 # WEB STREAMING SERVER
 # =========================
 web_app = Flask(__name__)
+
+# Suppress noisy Flask /api/stats request logs
+class StatsFilter(logging.Filter):
+    def filter(self, record):
+        msg = record.getMessage()
+        if '/api/stats' in msg:
+            return False
+        return True
+
+log = logging.getLogger('werkzeug')
+log.addFilter(StatsFilter())
 
 WEB_PAGE = """
 <!DOCTYPE html>
@@ -226,16 +294,19 @@ WEB_PAGE = """
             <!-- Machine Control Card -->
             <div class="machine-card running" id="machineCard">
                 <div class="machine-status" id="machineStatus">MACHINE RUNNING</div>
-                <div class="btn-row">
-                    <button class="ctrl-btn btn-start" id="btnStart" onclick="startMachine()" disabled>&#9654; START</button>
-                    <button class="ctrl-btn btn-stop"  id="btnStop"  onclick="stopMachine()">&#9632; STOP</button>
-                </div>
-                <button class="ctrl-btn btn-test" id="btnTest" onclick="testRelay()" style="margin-top:10px;width:100%;background:linear-gradient(135deg,#cc8800,#ffaa00);color:#222;">&#9889; TEST RELAY (2s pulse)</button>
-                <div id="testResult" style="margin-top:6px;font-size:13px;color:#888;min-height:18px;"></div>
             </div>
             <!-- Defect Alert -->
             <div class="defect-alert" id="defectAlert">
-                <div class="alert-text">DEFECT DETECTED &mdash; Machine Stopped</div>
+                <div class="alert-text">DEFECT DETECTED &mdash; Relay Pulsed</div>
+            </div>
+            <!-- Relay Status Card -->
+            <div class="stat-card" id="relayCard" style="border-color:#ffaa00;">
+                <div class="label">STATUS</div>
+                <div class="value" id="relayStatus" style="font-size:18px;color:#00ff88;">DETECTING</div>
+                <div style="margin-top:8px;font-size:12px;color:#666;">
+                    <span>Relay: Pin <span id="relayPin">7</span></span> &nbsp;|&nbsp;
+                    <span>Trigger: Pin <span id="triggerPin">33</span></span>
+                </div>
             </div>
             <!-- Stats Cards -->
             <div class="stat-card fps">
@@ -265,33 +336,6 @@ WEB_PAGE = """
         </div>
     </div>
     <script>
-        function startMachine() {
-            fetch('/api/resume', {method:'POST'}).then(r=>r.json()).then(()=>updateUI());
-        }
-        function stopMachine() {
-            fetch('/api/stop', {method:'POST'}).then(r=>r.json()).then(()=>updateUI());
-        }
-        function testRelay() {
-            var btn = document.getElementById('btnTest');
-            var res = document.getElementById('testResult');
-            btn.disabled = true;
-            res.textContent = 'Testing... relay should click ON now';
-            res.style.color = '#ffaa00';
-            fetch('/api/test_relay', {method:'POST'}).then(r=>r.json()).then(data => {
-                if (data.status === 'ok') {
-                    res.textContent = 'Pin ' + data.pin + ': HIGH for ' + data.duration + 's then LOW. GPIO=' + (data.gpio_available ? 'YES' : 'NO');
-                    res.style.color = '#00ff88';
-                } else {
-                    res.textContent = 'FAILED: ' + (data.error || 'unknown');
-                    res.style.color = '#ff4444';
-                }
-                btn.disabled = false;
-            }).catch(e => {
-                res.textContent = 'Error: ' + e;
-                res.style.color = '#ff4444';
-                btn.disabled = false;
-            });
-        }
         function updateUI() {
             fetch('/api/stats').then(r=>r.json()).then(data => {
                 document.getElementById('fps').textContent = data.fps.toFixed(1);
@@ -308,28 +352,43 @@ WEB_PAGE = """
                 const mstat = document.getElementById('machineStatus');
                 const dot   = document.getElementById('statusDot');
                 const alert = document.getElementById('defectAlert');
-                const btnS  = document.getElementById('btnStart');
-                const btnP  = document.getElementById('btnStop');
 
-                if (data.machine_paused) {
-                    card.className  = 'machine-card stopped';
-                    mstat.textContent = 'MACHINE STOPPED';
-                    dot.className   = 'status-dot stopped';
-                    btnS.disabled   = false;
-                    btnP.disabled   = true;
-                    alert.classList.add('active');
-                } else {
-                    card.className  = 'machine-card running';
-                    mstat.textContent = 'MACHINE RUNNING';
-                    dot.className   = 'status-dot live';
-                    btnS.disabled   = true;
-                    btnP.disabled   = false;
-                    if (data.current_defects > 0) {
+                // Update machine status based on relay state
+                var rs = document.getElementById('relayStatus');
+                var rc = document.getElementById('relayCard');
+                if (data.relay_status) {
+                    if (data.relay_status === 'RELAY_ON') {
+                        rs.textContent = 'RELAY ON';
+                        rs.style.color = '#ff4444';
+                        rc.style.borderColor = '#ff4444';
+                        card.className = 'machine-card stopped';
+                        mstat.textContent = 'RELAY ON (' + data.relay_on_duration + 's)';
+                        dot.className = 'status-dot stopped';
+                        alert.classList.add('active');
+                    } else if (data.relay_status === 'DEFECT_STOP' || data.relay_status === 'WAITING_RESUME') {
+                        rs.textContent = 'WAITING RESUME (Pin ' + data.trigger_pin + ')';
+                        rs.style.color = '#ffaa00';
+                        rc.style.borderColor = '#ffaa00';
+                        card.className = 'machine-card stopped';
+                        mstat.textContent = 'DEFECT — WAITING RESUME';
+                        dot.className = 'status-dot stopped';
                         alert.classList.add('active');
                     } else {
-                        alert.classList.remove('active');
+                        rs.textContent = 'DETECTING';
+                        rs.style.color = '#00ff88';
+                        rc.style.borderColor = '#00ff88';
+                        card.className = 'machine-card running';
+                        mstat.textContent = 'DETECTING';
+                        dot.className = 'status-dot live';
+                        if (data.current_defects > 0) {
+                            alert.classList.add('active');
+                        } else {
+                            alert.classList.remove('active');
+                        }
                     }
                 }
+                if (data.relay_pin) document.getElementById('relayPin').textContent = data.relay_pin;
+                if (data.trigger_pin) document.getElementById('triggerPin').textContent = data.trigger_pin;
             }).catch(()=>{});
         }
         setInterval(updateUI, 500);
@@ -366,38 +425,6 @@ def video_feed():
 def api_stats():
     with stats_lock:
         return jsonify(live_stats)
-
-@web_app.route('/api/resume', methods=['POST'])
-def api_resume():
-    """Resume machine after defect stop"""
-    deactivate_relay()
-    return jsonify({"status": "resumed"})
-
-@web_app.route('/api/stop', methods=['POST'])
-def api_stop():
-    """Manually stop machine"""
-    activate_relay()
-    return jsonify({"status": "stopped"})
-
-@web_app.route('/api/test_relay', methods=['POST'])
-def api_test_relay():
-    """Test relay with a 2-second pulse: HIGH then LOW"""
-    duration = 2
-    try:
-        if RELAY_ENABLED and GPIO:
-            GPIO.output(RELAY_PIN, GPIO.HIGH)
-            print(f"TEST: Relay Pin {RELAY_PIN} -> HIGH")
-            time.sleep(duration)
-            GPIO.output(RELAY_PIN, GPIO.LOW)
-            print(f"TEST: Relay Pin {RELAY_PIN} -> LOW")
-            return jsonify({"status": "ok", "pin": RELAY_PIN, "duration": duration, "gpio_available": True})
-        else:
-            print(f"TEST: GPIO not available (RELAY_ENABLED={RELAY_ENABLED}, GPIO={GPIO})")
-            return jsonify({"status": "ok", "pin": RELAY_PIN, "duration": duration, "gpio_available": False,
-                            "error": "GPIO not available - check Jetson.GPIO install and /sys access"})
-    except Exception as e:
-        print(f"TEST RELAY ERROR: {e}")
-        return jsonify({"status": "error", "error": str(e)})
 
 def start_web_server():
     """Start Flask in a background thread"""
@@ -607,8 +634,10 @@ if HAS_DISPLAY:
 # =========================
 # MAIN LOOP
 # =========================
+# Flow: Detect continuously → defect found → relay ON 2s (background) + wait Pin 33 HIGH → resume detection
 try:
     while True:
+        set_relay_status("DETECTING")
         loop_start = time.time()
 
         # Get image from camera
@@ -675,11 +704,18 @@ try:
             defect_frame_count += 1
             time_str = time.strftime("%H:%M:%S")
             
-            for box in boxes:
+            print(f"\n{'='*60}")
+            print(f"  DEFECT DETECTED | Frame #{frame_count} | {time_str}")
+            print(f"  Defects in frame: {defect_count}")
+            print(f"{'='*60}")
+            
+            for idx, box in enumerate(boxes):
                 cls = int(box.cls[0])
                 conf = float(box.conf[0])
                 class_name = model.names[cls]
                 x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+
+                print(f"  [{idx+1}] Class: {class_name} | Confidence: {conf:.2f} | BBox: ({x1},{y1})-({x2},{y2})")
 
                 defect_log.append({
                     "time": time_str,
@@ -700,38 +736,26 @@ try:
                 cv2.putText(display_frame, label, (x1, y1 - 5),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
-            # Save ONLY defect frames
-            frame_path = os.path.join(
-                RESULTS_FOLDER, f"defect_{defect_frame_count:06d}_{timestamp_str}.jpg"
-            )
-            cv2.imwrite(frame_path, display_frame)
+            # ── DEFECT ACTIONS (two parallel branches) ──
+            # Branch 1: Relay ON for 2 seconds then OFF (background thread)
+            print(f"  >> PULSING RELAY — ON for {RELAY_ON_DURATION}s (background)...")
+            relay_thread = threading.Thread(target=pulse_relay, daemon=True)
+            relay_thread.start()
 
-            # === RELAY: Stop machine on defect ===
-            if not machine_paused:
-                activate_relay()
-
-        # If machine is paused, wait for resume signal
-        if machine_paused:
-            # Keep updating web stream with "PAUSED" overlay while waiting
-            paused_frame = display_frame.copy()
-            overlay = paused_frame.copy()
-            cv2.rectangle(overlay, (0, 0), (paused_frame.shape[1], paused_frame.shape[0]), (0, 0, 80), -1)
-            cv2.addWeighted(overlay, 0.4, paused_frame, 0.6, 0, paused_frame)
-            cv2.putText(paused_frame, "MACHINE STOPPED", (paused_frame.shape[1]//2 - 250, paused_frame.shape[0]//2 - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
-            cv2.putText(paused_frame, "Defect Detected - Press START to continue",
-                        (paused_frame.shape[1]//2 - 350, paused_frame.shape[0]//2 + 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            # Update web stream with defect info
             if ENABLE_WEB:
                 with frame_lock:
-                    latest_frame = paused_frame.copy()
+                    latest_frame = display_frame.copy()
                 with stats_lock:
-                    live_stats["machine_paused"] = True
-            # Block detection loop until resume
-            print("    Waiting for RESUME signal (web dashboard or physical button)...")
-            pause_event.wait()  # Blocks here until resume
-            print("    Resumed! Continuing detection...")
-            continue
+                    live_stats["relay_status"] = "DEFECT_STOP"
+                    live_stats["current_defects"] = defect_count
+
+            # Branch 2: Wait for HIGH signal on Pin 33 to resume detection
+            print(f"  >> WAITING for HIGH signal on Pin {TRIGGER_PIN} to resume detection...")
+            wait_for_resume_signal()
+            ts_resume = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(f"  [{ts_resume}] Resume signal received — detection RESUMED!")
+            set_relay_status("DETECTING")
 
         # Calculate FPS
         loop_time = time.time() - loop_start
@@ -781,10 +805,13 @@ try:
                 live_stats["uptime"] = time.time() - start_time
                 live_stats["model"] = MODEL_PATH
                 live_stats["camera_ip"] = TARGET_CAMERA_IP
-                live_stats["machine_paused"] = machine_paused
                 live_stats["relay_enabled"] = RELAY_ENABLED
+                live_stats["relay_status"] = get_relay_status()
+                live_stats["relay_pin"] = RELAY_PIN
+                live_stats["trigger_pin"] = TRIGGER_PIN
+                live_stats["relay_on_duration"] = RELAY_ON_DURATION
 
-        # Console status every 30 frames
+        # Console status
         if frame_count % 30 == 0:
             print(f"Frame {frame_count:06d} | FPS: {avg_fps:.1f} | "
                   f"Defects: {defect_count} | Saved: {defect_frame_count}")
@@ -797,9 +824,12 @@ except KeyboardInterrupt:
 # =========================
 print("\nCleaning up...")
 if RELAY_ENABLED and GPIO:
-    GPIO.output(RELAY_PIN, GPIO.LOW)
+    try:
+        GPIO.output(RELAY_PIN, GPIO.HIGH)  # Relay OFF
+    except Exception:
+        pass
     GPIO.cleanup()
-    print("\u2713 GPIO cleaned up")
+    print("\u2713 GPIO cleaned up (relay OFF)")
 if HAS_DISPLAY:
     cv2.destroyAllWindows()
 cam.MV_CC_StopGrabbing()

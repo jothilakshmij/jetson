@@ -37,6 +37,9 @@ services:
       - WEB_PORT=${WEB_PORT:-3000}
       - RELAY_ENABLED=${RELAY_ENABLED:-true}
       - RELAY_PIN=${RELAY_PIN:-7}
+      - RESUME_PIN=${RESUME_PIN:-33}
+      - DEFECT_LIGHT_PIN=${DEFECT_LIGHT_PIN:-32}
+      - GREEN_LIGHT_PIN=${GREEN_LIGHT_PIN:-31}
 
     volumes:
       # ── App code (EDITABLE — edit on Jetson, changes reflect instantly) ──
