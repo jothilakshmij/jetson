@@ -116,7 +116,8 @@ def wait_for_resume_signal():
                     return
                 else:
                     ts2 = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-                    print(f"  [{ts2}] Pin {TRIGGER_PIN} false trigger ({high_count}/{DEBOUNCE_COUNT} HIGH reads) — ignoring")
+                    print(f"  [{ts2}] Pin {TRIGGER_PIN} confirmed HIGH — resume signal received!")
+                    return
             time.sleep(TRIGGER_POLL_INTERVAL)
     else:
         # No GPIO — just log and return immediately (continuous detection)
